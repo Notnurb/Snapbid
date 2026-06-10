@@ -6,6 +6,9 @@ name: Preview tunnel
 on:
   workflow_dispatch:
 
+permissions:
+  contents: write
+
 jobs:
   tunnel:
     runs-on: ubuntu-latest
@@ -68,6 +71,7 @@ jobs:
           curl -sf -o /dev/null http://localhost:3000/ || { cat server.log; exit 1; }
 
       - name: Open Cloudflare tunnel
+        id: tunnel
         run: |
           curl -sL -o cloudflared https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64
           chmod +x cloudflared
@@ -83,5 +87,25 @@ jobs:
           echo "TUNNEL_URL: $URL"
           echo "=================================================="
           echo "::notice title=SnapBid preview tunnel::$URL"
-          # Keep the runner (and tunnel) alive ~5 hours.
-          sleep 18000
+          echo "url=$URL" >> "$GITHUB_OUTPUT"
+
+      # Job logs aren't readable until the job ends, so publish the URL to a
+      # branch that can be fetched while the tunnel is still up.
+      - name: Publish tunnel URL to tunnel-info branch
+        run: |
+          DIR=$(mktemp -d)
+          cd "$DIR"
+          git init -q -b tunnel-info
+          git config user.name "snapbid-tunnel"
+          git config user.email "actions@github.com"
+          {
+            echo "${{ steps.tunnel.outputs.url }}"
+            echo "run: ${{ github.run_id }}"
+            date -u +"started: %Y-%m-%dT%H:%M:%SZ"
+          } > TUNNEL_URL.txt
+          git add TUNNEL_URL.txt
+          git commit -q -m "tunnel url for run ${{ github.run_id }}"
+          git push -f -q "https://x-access-token:${{ github.token }}@github.com/${{ github.repository }}.git" tunnel-info
+
+      - name: Keep tunnel alive (~5h)
+        run: sleep 18000
