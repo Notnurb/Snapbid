@@ -1,0 +1,87 @@
+name: Preview tunnel
+
+# Runs the app on a GitHub runner and exposes it through a Cloudflare quick
+# tunnel. Trigger manually; the public URL is printed in the job log and as a
+# workflow notice. The tunnel stays up ~5 hours or until the run is canceled.
+on:
+  workflow_dispatch:
+
+jobs:
+  tunnel:
+    runs-on: ubuntu-latest
+    timeout-minutes: 310
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: snapbid
+          POSTGRES_PASSWORD: snapbid
+          POSTGRES_DB: snapbid
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U snapbid"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Write env
+        run: |
+          cat > .env <<'EOF'
+          DATABASE_URL="postgresql://snapbid:snapbid@localhost:5432/snapbid"
+          DIRECT_URL="postgresql://snapbid:snapbid@localhost:5432/snapbid"
+          NEXT_PUBLIC_SUPABASE_URL="https://placeholder.supabase.co"
+          SUPABASE_SERVICE_ROLE_KEY="placeholder"
+          NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY="pk_test_Y2xlcmsuZXhhbXBsZS5jb20k"
+          CLERK_SECRET_KEY="sk_test_placeholder"
+          GROQ_API_KEY="placeholder"
+          STRIPE_SECRET_KEY="sk_test_placeholder"
+          STRIPE_WEBHOOK_SECRET="whsec_placeholder"
+          RESEND_API_KEY="re_placeholder"
+          NEXT_PUBLIC_APP_URL="http://localhost:3000"
+          EOF
+          # Real keys (Clerk, Groq, Stripe...) can be added as repo secrets and
+          # mapped here later to make auth and AI work in the preview.
+
+      - name: Install
+        run: npm ci
+
+      - name: Create tables
+        run: npx prisma db push --skip-generate
+
+      - name: Build and start
+        run: |
+          npm run build
+          nohup npm start > server.log 2>&1 &
+          for i in $(seq 1 30); do
+            curl -sf -o /dev/null http://localhost:3000/ && break
+            sleep 2
+          done
+          curl -sf -o /dev/null http://localhost:3000/ || { cat server.log; exit 1; }
+
+      - name: Open Cloudflare tunnel
+        run: |
+          curl -sL -o cloudflared https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64
+          chmod +x cloudflared
+          nohup ./cloudflared tunnel --url http://localhost:3000 > tunnel.log 2>&1 &
+          URL=""
+          for i in $(seq 1 30); do
+            URL=$(grep -oE 'https://[a-z0-9-]+\.trycloudflare\.com' tunnel.log | head -1)
+            [ -n "$URL" ] && break
+            sleep 2
+          done
+          if [ -z "$URL" ]; then cat tunnel.log; exit 1; fi
+          echo "=================================================="
+          echo "TUNNEL_URL: $URL"
+          echo "=================================================="
+          echo "::notice title=SnapBid preview tunnel::$URL"
+          # Keep the runner (and tunnel) alive ~5 hours.
+          sleep 18000
