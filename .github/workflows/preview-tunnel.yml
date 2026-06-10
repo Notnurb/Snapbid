@@ -1,8 +1,13 @@
 name: Preview tunnel
 
 # Runs the app on a GitHub runner and exposes it through a Cloudflare quick
-# tunnel. Trigger manually; the public URL is printed in the job log and as a
-# workflow notice. The tunnel stays up ~5 hours or until the run is canceled.
+# tunnel. Trigger manually; the URL is published to the tunnel-info branch.
+# The tunnel stays up ~5 hours or until the run is canceled.
+#
+# Auth: runs `next dev` so Clerk keyless mode provisions a temporary dev
+# instance automatically — sign-in works with zero configured keys. Add real
+# keys as repo secrets (CLERK_SECRET_KEY, NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY,
+# GROQ_API_KEY, ...) to use your own instance and enable AI/payments/email.
 on:
   workflow_dispatch:
 
@@ -36,39 +41,8 @@ jobs:
           node-version: 22
           cache: npm
 
-      - name: Write env
-        run: |
-          cat > .env <<'EOF'
-          DATABASE_URL="postgresql://snapbid:snapbid@localhost:5432/snapbid"
-          DIRECT_URL="postgresql://snapbid:snapbid@localhost:5432/snapbid"
-          NEXT_PUBLIC_SUPABASE_URL="https://placeholder.supabase.co"
-          SUPABASE_SERVICE_ROLE_KEY="placeholder"
-          NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY="pk_test_Y2xlcmsuZXhhbXBsZS5jb20k"
-          CLERK_SECRET_KEY="sk_test_placeholder"
-          GROQ_API_KEY="placeholder"
-          STRIPE_SECRET_KEY="sk_test_placeholder"
-          STRIPE_WEBHOOK_SECRET="whsec_placeholder"
-          RESEND_API_KEY="re_placeholder"
-          NEXT_PUBLIC_APP_URL="http://localhost:3000"
-          EOF
-          # Real keys (Clerk, Groq, Stripe...) can be added as repo secrets and
-          # mapped here later to make auth and AI work in the preview.
-
       - name: Install
         run: npm ci
-
-      - name: Create tables
-        run: npx prisma db push --skip-generate
-
-      - name: Build and start
-        run: |
-          npm run build
-          nohup npm start > server.log 2>&1 &
-          for i in $(seq 1 30); do
-            curl -sf -o /dev/null http://localhost:3000/ && break
-            sleep 2
-          done
-          curl -sf -o /dev/null http://localhost:3000/ || { cat server.log; exit 1; }
 
       - name: Open Cloudflare tunnel
         id: tunnel
@@ -83,17 +57,55 @@ jobs:
             sleep 2
           done
           if [ -z "$URL" ]; then cat tunnel.log; exit 1; fi
-          echo "=================================================="
           echo "TUNNEL_URL: $URL"
-          echo "=================================================="
           echo "::notice title=SnapBid preview tunnel::$URL"
           echo "url=$URL" >> "$GITHUB_OUTPUT"
+
+      - name: Write env
+        env:
+          CLERK_SK: ${{ secrets.CLERK_SECRET_KEY }}
+          CLERK_PK: ${{ secrets.NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY }}
+        run: |
+          cat > .env <<EOF
+          DATABASE_URL="postgresql://snapbid:snapbid@localhost:5432/snapbid"
+          DIRECT_URL="postgresql://snapbid:snapbid@localhost:5432/snapbid"
+          NEXT_PUBLIC_SUPABASE_URL="${{ secrets.NEXT_PUBLIC_SUPABASE_URL || 'https://placeholder.supabase.co' }}"
+          SUPABASE_SERVICE_ROLE_KEY="${{ secrets.SUPABASE_SERVICE_ROLE_KEY || 'placeholder' }}"
+          GROQ_API_KEY="${{ secrets.GROQ_API_KEY || 'placeholder' }}"
+          STRIPE_SECRET_KEY="${{ secrets.STRIPE_SECRET_KEY || 'sk_test_placeholder' }}"
+          STRIPE_WEBHOOK_SECRET="whsec_placeholder"
+          RESEND_API_KEY="${{ secrets.RESEND_API_KEY || 're_placeholder' }}"
+          NEXT_PUBLIC_APP_URL="${{ steps.tunnel.outputs.url }}"
+          EOF
+          # Clerk keys are written only when real ones exist as secrets;
+          # otherwise they're omitted entirely so keyless mode activates.
+          if [ -n "$CLERK_SK" ] && [ -n "$CLERK_PK" ]; then
+            echo "CLERK_SECRET_KEY=$CLERK_SK" >> .env
+            echo "NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY=$CLERK_PK" >> .env
+          fi
+
+      - name: Create tables
+        run: npx prisma db push --skip-generate
+
+      - name: Start app (dev mode for Clerk keyless)
+        run: |
+          nohup npm run dev > server.log 2>&1 &
+          for i in $(seq 1 45); do
+            curl -sf -o /dev/null http://localhost:3000/ && break
+            sleep 2
+          done
+          curl -sf -o /dev/null http://localhost:3000/ || { cat server.log; exit 1; }
 
       # Job logs aren't readable until the job ends, so publish the URL to a
       # branch that can be fetched while the tunnel is still up.
       - name: Publish tunnel URL to tunnel-info branch
         run: |
+          CLAIM_URL=$(grep -oE 'https://[^ ]*clerk[^ ]*keyless[^ ]*' server.log | head -1 || true)
+          if [ -z "$CLAIM_URL" ] && [ -f .clerk/.tmp/keyless.json ]; then
+            CLAIM_URL=$(grep -oE '"claimUrl":"[^"]+"' .clerk/.tmp/keyless.json | cut -d'"' -f4 || true)
+          fi
           DIR=$(mktemp -d)
+          SRC=$(pwd)
           cd "$DIR"
           git init -q -b tunnel-info
           git config user.name "snapbid-tunnel"
@@ -102,10 +114,12 @@ jobs:
             echo "${{ steps.tunnel.outputs.url }}"
             echo "run: ${{ github.run_id }}"
             date -u +"started: %Y-%m-%dT%H:%M:%SZ"
+            [ -n "$CLAIM_URL" ] && echo "clerk_claim: $CLAIM_URL"
           } > TUNNEL_URL.txt
           git add TUNNEL_URL.txt
           git commit -q -m "tunnel url for run ${{ github.run_id }}"
           git push -f -q "https://x-access-token:${{ github.token }}@github.com/${{ github.repository }}.git" tunnel-info
+          cd "$SRC"
 
       - name: Keep tunnel alive (~5h)
         run: sleep 18000

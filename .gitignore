@@ -31,3 +31,6 @@ next-env.d.ts
 
 # prisma
 /src/generated
+
+# clerk keyless
+/.clerk/
